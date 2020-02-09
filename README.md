@@ -6,6 +6,8 @@ M5Stackをポケットプリンタに見立てて、ゲームボーイのポケ�
 
 ![](https://raw.githubusercontent.com/niccolli/m5stack-synth-emulation/master/assets/gb_printer_demo.jpg)
 
+[https://twitter.com/niccolli/status/1225983387761987584](https://twitter.com/niccolli/status/1225983387761987584)
+
 ## Require
 
 * M5Stack
@@ -28,7 +30,7 @@ M5Stackと初期型ゲームボーイを通信ケーブルで接続する際、�
 ## Build
 
 ```
-git clone --recursive https://github.com/h1romas4/m5stack-synth-emulation.git
+git clone --recursive https://github.com/niccolli/m5stack-synth-emulation.git
 cd m5stack-synth-emulation
 # This repository includes eps-idf v3.2.3
 export IDF_PATH=$(pwd)/esp-idf
