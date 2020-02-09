@@ -1,274 +1,336 @@
+#pragma GCC diagnostic warning "-fpermissive"
+
 #include <M5Stack.h>
-#include "nvs_flash.h"
-#include "esp_partition.h"
-#include <esp_heap_caps.h>
-#include "driver/i2s.h"
-#include "ym2612.hpp"
-extern "C" {
-#include "sn76489.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include "driver/gpio.h"
+#include "buffer.h"
+#include "esp_log.h"
+
+#include "esp_types.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "soc/timer_group_struct.h"
+#include "driver/periph_ctrl.h"
+#include "driver/timer.h"
+
+static const char* TAG = "Printer";
+xQueueHandle timer_queue;
+
+#define GPIOP_SCK GPIO_NUM_2
+#define GPIOP_SIN GPIO_NUM_5
+#define GPIOP_SOUT GPIO_NUM_36
+
+#define ESP_INTR_FLAG_DEFAULT 0
+
+// 変換後の画像データの設定
+// 初期値は何でもいい
+#define PICTURE_WIDTH  160
+#define PICTURE_HEIGHT 144
+uint16_t bmp[PICTURE_WIDTH * PICTURE_HEIGHT] = {ORANGE};
+
+const char printer_magic[] = {0x88, 0x33};
+
+// 受信データを貯めておく領域の設定
+#define MAX_DATA_LENGTH 5984
+unsigned char data[6000] = {0};
+unsigned int data_ptr = 0;
+
+enum printer_state
+{
+    PS_MAGIC0,
+    PS_MAGIC1,
+    PS_CMD,
+    PS_ARG0,
+    PS_LEN_LOW,
+    PS_LEN_HIGH,
+    PS_DATA,
+    PS_CHECKSUM0,
+    PS_CHECKSUM1,
+    PS_ACK,
+    PS_STATUS
+};
+enum printer_state printer_state;
+enum printer_state printer_state_prev;
+uint16_t printer_data_len;
+
+volatile uint8_t gb_sin, gb_sout;
+volatile uint8_t gb_bit;
+
+struct circular_buf recv_buf;
+
+static void printer_state_reset()
+{
+    printer_data_len = 0;
+    printer_state = PS_MAGIC0;
+    printer_state_prev = printer_state;
 }
 
-#define SAMPLING_RATE 44100
-#define FRAME_SIZE_MAX 2048
-
-#define STEREO 2
-#define MONO 0
-
-uint8_t *vgm;
-uint32_t vgmpos = 0x40;
-bool vgmend = false;
-uint32_t vgmloopoffset;
-uint32_t datpos;
-uint32_t pcmpos;
-uint32_t pcmoffset;
-
-uint32_t clock_sn76489;
-uint32_t clock_ym2612;
-
-SN76489_Context *sn76489;
-
-uint8_t *get_vgmdata()
+static void printer_state_update(uint8_t b)
 {
-    uint8_t* data;
-    const esp_partition_t* part;
-    spi_flash_mmap_handle_t hrom;
-    esp_err_t err;
-
-    nvs_flash_init();
-
-    part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_PHY, NULL);
-    if (part == 0) {
-        printf("Couldn't find vgm part!\n");
+    printer_state_prev = printer_state;
+    switch (printer_state)
+    {
+    case PS_MAGIC0:
+        if (b == printer_magic[0])
+        {
+            printer_state = PS_MAGIC1;
+        }
+        break;
+    case PS_MAGIC1:
+        if (b == printer_magic[1])
+        {
+            printer_state = PS_CMD;
+        }
+        else
+        {
+            printer_state = PS_MAGIC0;
+        }
+        break;
+    case PS_CMD:
+        printer_state = PS_ARG0;
+        break;
+    case PS_ARG0:
+        printer_state = PS_LEN_LOW;
+        break;
+    case PS_LEN_LOW:
+        printer_data_len = b;
+        printer_state = PS_LEN_HIGH;
+        break;
+    case PS_LEN_HIGH:
+        printer_data_len |= b << 8;
+        if (printer_data_len != 0)
+        {
+            printer_state = PS_DATA;
+        }
+        else
+        {
+            printer_state = PS_CHECKSUM0;
+        }
+        break;
+    case PS_DATA:
+        printer_data_len--;
+        printer_state = (printer_data_len == 0) ? PS_CHECKSUM0 : PS_DATA;
+        break;
+    case PS_CHECKSUM0:
+        printer_state = PS_CHECKSUM1;
+        break;
+    case PS_CHECKSUM1:
+        printer_state = PS_ACK;
+        break;
+    case PS_ACK:
+        printer_state = PS_STATUS;
+        break;
+    case PS_STATUS:
+        printer_state = PS_MAGIC0;
+        break;
+    default:
+        break;
     }
-
-    err = esp_partition_mmap(part, 0, 0x1EF000, SPI_FLASH_MMAP_DATA, (const void**)&data, &hrom);
-    if (err != ESP_OK) {
-        printf("Couldn't map vgm part!\n");
-    }
-    printf("read vgm data @%p\n", data);
-
-    return (uint8_t *)data;
 }
 
-uint8_t get_vgm_ui8()
+inline static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
-    return vgm[vgmpos++];
-}
-
-uint16_t get_vgm_ui16()
-{
-    return get_vgm_ui8() + (get_vgm_ui8() << 8);
-}
-
-uint32_t get_vgm_ui32()
-{
-    return get_vgm_ui8() + (get_vgm_ui8() << 8) + (get_vgm_ui8() << 16) + (get_vgm_ui8() << 24);
-}
-
-uint16_t parse_vgm()
-{
-    uint8_t command;
-    uint16_t wait = 0;
-    uint8_t reg;
-    uint8_t dat;
-
-    command = get_vgm_ui8();
-    switch (command) {
-        case 0x50:
-            dat = get_vgm_ui8();
-            SN76489_Write(sn76489, dat);
-            break;
-        case 0x52:
-        case 0x53:
-            reg = get_vgm_ui8();
-            dat = get_vgm_ui8();
-            YM2612_Write(0 + ((command & 1) << 1), reg);
-            YM2612_Write(1 + ((command & 1) << 1), dat);
-            break;
-        case 0x61:
-            wait = get_vgm_ui16();
-            break;
-        case 0x62:
-            wait = 735;
-            break;
-        case 0x63:
-            wait = 882;
-            break;
-        case 0x66:
-            if(vgmloopoffset == 0) {
-                vgmend = true;
-            } else {
-                vgmpos = vgmloopoffset;
+    if (gpio_get_level(GPIOP_SCK) == 0)
+    { // FALLING
+        gb_sout |= gpio_get_level(GPIOP_SOUT) ? 1 : 0;
+        gb_bit++;
+        if (gb_bit == 8)
+        {
+            // 1バイトがまとまったので送信する
+            //usart_send_blocking(USART2, gb_sout);
+            data[data_ptr++] = gb_sout;
+            printer_state_update(gb_sout);
+            switch (printer_state)
+            {
+            case PS_ACK:
+                buf_push(&recv_buf, 0x81);
+                break;
+            case PS_STATUS:
+                buf_push(&recv_buf, 0x00);
+                break;
+            default:
+                break;
             }
+
+            // Reset state
+            gb_bit = 0;
+            gb_sout = 0;
+
+            // Prepare next gb_sin
+            if (buf_empty(&recv_buf))
+            {
+                gb_sin = 0x00;
+            }
+            else
+            {
+                gb_sin = buf_pop(&recv_buf);
+            }
+        }
+        else
+        {
+            gb_sin <<= 1;
+            gb_sout <<= 1;
+        }
+    }
+    else
+    { // RISING
+        (gb_sin & 0x80) ? gpio_set_level(GPIOP_SIN, 1) : gpio_set_level(GPIOP_SIN, 0);
+    }
+
+    if(data_ptr == MAX_DATA_LENGTH){
+        xQueueSendFromISR(timer_queue, NULL, NULL);
+    }
+}
+
+static void gblink_slave_gpio_setup()
+{
+    gpio_config_t io_conf;
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.GPIO18/19
+    io_conf.pin_bit_mask = (1ULL<<GPIOP_SIN);
+    //disable pull-down mode
+    io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    //disable pull-up mode
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+    gpio_set_level(GPIOP_SIN, 0);
+
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL<<GPIOP_SOUT);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+
+    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL<<GPIOP_SCK);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+
+    gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    gpio_isr_handler_add(GPIOP_SCK, gpio_isr_handler, (void*) GPIOP_SCK);
+}
+
+extern "C" {
+	int app_main(void);
+}
+
+/*
+ * The main task of this example program
+ */
+
+static uint8_t rows=0;
+
+inline uint16_t convertColor(uint8_t dot){
+    switch(dot) {
+        case 0x00:
+            return WHITE;
             break;
-        case 0x67:
-            get_vgm_ui8(); // 0x66
-            get_vgm_ui8(); // 0x00 data type
-            datpos = vgmpos + 4;
-            vgmpos += get_vgm_ui32(); // size of data, in bytes
+        case 0x01:
+            return LIGHTGREY;
             break;
-        case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
-        case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
-            wait = (command & 0x0f) + 1;
+        case 0x10:
+            return DARKGREY;
             break;
-        case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
-        case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
-            wait = (command & 0x0f);
-            YM2612_Write(0, 0x2a);
-            YM2612_Write(1, vgm[datpos + pcmpos + pcmoffset]);
-            pcmoffset++;
-            break;
-        case 0xe0:
-            pcmpos = get_vgm_ui32();
-            pcmoffset = 0;
+        case 0x11:
+            return BLACK;
             break;
         default:
-            printf("unknown cmd at 0x%x: 0x%x\n", vgmpos, vgm[vgmpos]);
-            vgmpos++;
+            return 0x00;
             break;
     }
-
-	return wait;
+    return ORANGE;
 }
 
-static const i2s_port_t i2s_num = I2S_NUM_0; // i2s port number
-
-void init_dac(void)
+static void timer_example_evt_task(void *arg)
 {
-    i2s_config_t i2s_config = {
-        .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
-        .sample_rate = SAMPLING_RATE,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
-        .communication_format = static_cast<i2s_comm_format_t>(I2S_COMM_FORMAT_I2S_MSB),
-        .intr_alloc_flags = 0,
-        .dma_buf_count = 16,
-        .dma_buf_len = 512,
-        .use_apll = false,
-        .tx_desc_auto_clear = true,
-        .fixed_mclk = 0
-    };
+    while (1) {
+        xQueueReceive(timer_queue, NULL, portMAX_DELAY);
 
-    i2s_driver_install(i2s_num, &i2s_config, 0, NULL);
-    i2s_set_pin(i2s_num, NULL);
-}
+        /* Print information that the timer reported an event */
+        rows = 0;
+        data_ptr = 0;
+        printf("This is Test\n");
 
-// The setup routine runs once when M5Stack starts up
-void setup()
-{
-    // Initialize the M5Stack object
-    M5.begin();
+        // ここで受信データから画像部分を取り出し、ビットマップに変換したあと、
+        // M5Stackの画像表示を一気に呼ぶ
+        // if(rows < 18){
+            for(int i = 0; i < MAX_DATA_LENGTH-15; i++){
+                // 受信データがif文の条件の順で並んでいるとき、それ以降の640バイトがドットデータとなる。
+                // https://dhole.github.io/post/gameboy_serial_2/
+                if(data[i] == 0x88 && data[i+1] == 0x33 && data[i+2] == 0x04 && data[i+3] == 0x00 && data[i+4] == 0x80 && data[i+5] == 0x02){
+                    // 640バイトで160*16ドットを表現
+                    // 8x8ドットごとに並べていく
+                    // 1ドットあたり2ビット :: 2バイトで8ドット
+                    uint8_t *payload = data+i+6;
 
-    // Initialize
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.print("MEGADRIVE/GENESIS sound emulation by M5Stack.\n\n");
+                    for(uint8_t cols = 0; cols < 20; cols++){
+                        // タイル位置データのコピーを実施
+                        uint8_t *tile;
+                        tile = payload+cols*16;
+                        uint8_t tile_x, tile_y;
+                        for(tile_y = 0; tile_y < 16; tile_y+=2){
+                            for(tile_x = 0; tile_x < 8; tile_x++){
+                                uint8_t mask = 0x01 << (7-tile_x) ;
+                                uint8_t dot;
+                                dot =  (tile[tile_y  ] & mask) ? 1 : 0;
+                                dot += (tile[tile_y+1] & mask) ? 2 : 0;
+                                bmp[(rows*8+tile_y/2)*160+(cols*8+tile_x)] = convertColor(dot);
+                            }
+                        }
+                    }
 
-    // Load vgm data
-    vgm = get_vgmdata();
+                    rows++;
 
-    // read vgm header
-    vgmpos = 0x0C; clock_sn76489 = get_vgm_ui32();
-    vgmpos = 0x2C; clock_ym2612 = get_vgm_ui32();
-    vgmpos = 0x1c; vgmloopoffset = get_vgm_ui32();
-    vgmpos = 0x34; vgmpos = 0x34 + get_vgm_ui32();
+                    payload = data+i+6+320;
 
-    if(clock_ym2612 == 0) clock_ym2612 = 7670453;
-    if(clock_sn76489 == 0) clock_sn76489 = 3579545;
-
-    printf("clock_sn76489 : %d\n", clock_sn76489);
-    printf("clock_ym2612 : %d\n", clock_ym2612);
-    printf("vgmpos : %x\n", vgmpos);
-
-    // init sound chip
-    sn76489 = SN76489_Init(clock_sn76489, SAMPLING_RATE);
-    SN76489_Reset(sn76489);
-    YM2612_Init(clock_ym2612, SAMPLING_RATE, 0);
-
-    // init internal DAC
-    init_dac();
-}
-
-short audio_write_sound_stereo(int sample32)
-{
-    short sample16;
-
-    if (sample32 < -0x7FFF) {
-        sample16 = -0x7FFF;
-    } else if (sample32 > 0x7FFF) {
-        sample16 = 0x7FFF;
-    } else {
-        sample16 = (short)(sample32);
+                    for(uint8_t cols = 0; cols < 20; cols++){
+                        // タイル位置データのコピーを実施
+                        uint8_t *tile;
+                        tile = payload+cols*16;
+                        uint16_t tile_x, tile_y;
+                        for(tile_y = 0; tile_y < 16; tile_y+=2){
+                            for(tile_x = 0; tile_x < 8; tile_x++){
+                                uint8_t mask = 0x01 << (7-tile_x) ;
+                                uint8_t dot;
+                                dot =  (tile[tile_y  ] & mask) ? 1 : 0;
+                                dot += (tile[tile_y+1] & mask) ? 2 : 0;
+                                bmp[(rows*8+tile_y/2)*160+(cols*8+tile_x)] = convertColor(dot);
+                            }
+                        }
+                    }
+                    rows++;
+                }
+            }
+            M5.Lcd.drawBitmap(0, 0, PICTURE_WIDTH, PICTURE_HEIGHT, (uint16_t*)bmp);
+        // }
     }
-
-    // for I2S_MODE_DAC_BUILT_IN
-    sample16 = sample16 ^ 0x8000U;
-
-    return sample16;
 }
 
-// The loop routine runs over and over again forever
-void loop()
+
+int app_main()
 {
-    size_t bytes_written = 0;
+    // put your setup code here, to run once:
+    M5.begin();
+    M5.Lcd.printf("hello world");
+    ESP_LOGI(TAG, "Start");
 
-    uint16_t frame_size;
-    uint32_t frame_all = 0;
+    printer_state_reset();
+    gblink_slave_gpio_setup();
 
-    // malloc sound buffer
-    int **buflr;
+    timer_queue = xQueueCreate(10, 0);
+    xTaskCreate(timer_example_evt_task, "timer_evt_task", 8192*3, NULL, 5, NULL);
 
-    buflr = (int **)malloc(sizeof(int *) * STEREO);
-    buflr[0] = (int *)heap_caps_malloc(FRAME_SIZE_MAX * sizeof(int), MALLOC_CAP_8BIT);
-    if(buflr[0] == NULL) printf("pcm buffer0 alloc fail.\n");
-    buflr[1] = (int *)heap_caps_malloc(FRAME_SIZE_MAX * sizeof(int), MALLOC_CAP_8BIT);
-    if(buflr[1] == NULL) printf("pcm buffer1 alloc fail.\n");
-
-    printf("last free memory8 %d\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
-
-    // free memory
-    M5.Lcd.printf("frame max size: %d\n", FRAME_SIZE_MAX);
-    M5.Lcd.printf("free memory: %d byte\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
-
-    int32_t last_frame_size;
-    int32_t update_frame_size;
-    do {
-        frame_size = parse_vgm();
-        last_frame_size = frame_size;
-        do {
-            if(last_frame_size > FRAME_SIZE_MAX) {
-                update_frame_size = FRAME_SIZE_MAX;
-            } else {
-                update_frame_size = last_frame_size;
-            }
-            // get sampling
-            SN76489_Update(sn76489, (int **)buflr, update_frame_size);
-            YM2612_Update((int **)buflr, update_frame_size);
-            YM2612_DacAndTimers_Update((int **)buflr, update_frame_size);
-            for(uint32_t i = 0; i < update_frame_size; i++) {
-                short d[STEREO];
-                d[0] = audio_write_sound_stereo(buflr[0][i]);
-                d[1] = audio_write_sound_stereo(buflr[1][i]);
-                i2s_write((i2s_port_t)i2s_num, d, sizeof(short) * STEREO, &bytes_written, portMAX_DELAY);
-            }
-            last_frame_size -= FRAME_SIZE_MAX;
-        } while(last_frame_size > 0);
-        frame_all += frame_size;
-    } while(!vgmend);
-
-    free(buflr[0]);
-    free(buflr[1]);
-    free(buflr);
-
-    YM2612_End();
-    SN76489_Shutdown(sn76489);
-
-    M5.Lcd.printf("\ntotal frame: %d %d\n", frame_all, frame_all / SAMPLING_RATE);
-
-    i2s_driver_uninstall((i2s_port_t)i2s_num); //stop & destroy i2s driver
-
-    M5.update();
-
-    while(true) {
-        asm volatile("nop\n\t nop\n\t nop\n\t nop\n\t");
+    while (1){
+        // ESP_LOGI(TAG, "ptr: %d", data_ptr);
+        delay(1);
     }
 }
