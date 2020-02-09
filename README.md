@@ -4,7 +4,7 @@ M5Stackをポケットプリンタに見立てて、ゲームボーイのポケ�
 
 ## Demo
 
-![](https://raw.githubusercontent.com/niccolli/m5stack-synth-emulation/master/assets/gb_printer_demo.jpg)
+![](https://raw.githubusercontent.com/niccolli/m5stack-gbprinter-emulation/master/assets/gb_printer_demo.jpg)
 
 [https://twitter.com/niccolli/status/1225983387761987584](https://twitter.com/niccolli/status/1225983387761987584)
 
@@ -23,15 +23,15 @@ gcc version 5.2.0 (crosstool-NG crosstool-ng-1.22.0-80-g6c4433a)
 
 M5Stackと初期型ゲームボーイを通信ケーブルで接続する際、下記の電圧降下回路を入れてください。
 
-![](https://raw.githubusercontent.com/niccolli/m5stack-synth-emulation/master/assets/schematic.png)
+![](https://raw.githubusercontent.com/niccolli/m5stack-gbprinter-emulation/master/assets/schematic.png)
 
 電池2本の本体では要らないかもしれません。
 
 ## Build
 
 ```
-git clone --recursive https://github.com/niccolli/m5stack-synth-emulation.git
-cd m5stack-synth-emulation
+git clone --recursive https://github.com/niccolli/m5stack-gbprinter-emulation.git
+cd m5stack-gbprinter-emulation
 # This repository includes eps-idf v3.2.3
 export IDF_PATH=$(pwd)/esp-idf
 make
