@@ -1,28 +1,31 @@
-# m5stack-synth-emulation
+# M5stack "Gameboy Printer" Emulation
 
-GENESIS/MEGADRIVE(YM2612+SN76489) VGM player on ESP32/M5Stack
+M5Stackをポケットプリンタに見立てて、ゲームボーイのポケットカメラから印刷ができるようにする仕組みです。
 
 ## Demo
 
-![](https://raw.githubusercontent.com/h1romas4/m5stack-synth-emulation/master/assets/m5stack-synth-02.jpg)
-
-[https://www.youtube.com/watch?v=dunNtkFS8gc](https://www.youtube.com/watch?v=dunNtkFS8gc)
+![](https://raw.githubusercontent.com/niccolli/m5stack-synth-emulation/master/assets/gb_printer_demo.jpg)
 
 ## Require
 
 * M5Stack
 * [esp32-idf toolchain setup](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html#setup-toolchain)
+* I/F Board
 
 ```
 $ xtensa-esp32-elf-gcc -v
 gcc version 5.2.0 (crosstool-NG crosstool-ng-1.22.0-80-g6c4433a)
 ```
 
+### I/F Board
+
+M5Stackと初期型ゲームボーイを通信ケーブルで接続する際、下記の電圧降下回路を入れてください。
+
+![](https://raw.githubusercontent.com/niccolli/m5stack-synth-emulation/master/assets/schematic.png)
+
+電池2本の本体では要らないかもしれません。
+
 ## Build
-
-![](https://github.com/h1romas4/m5stack-synth-emulation/workflows/M5Stack%20CI/badge.svg)
-
-**Compile**
 
 ```
 git clone --recursive https://github.com/h1romas4/m5stack-synth-emulation.git
@@ -32,64 +35,8 @@ export IDF_PATH=$(pwd)/esp-idf
 make
 ```
 
-**Upload sample VGM file to M5Stack flash**
+## 謝辞
 
-```
-./flashrom.sh vgm/ym2612.vgm
-```
+このESP-IDFとM5Stack Arduinoの混合環境は、[m5stack-synth-emulation](https://github.com/h1romas4/m5stack-synth-emulation)を利用しています。
 
-**Play music**
-
-```
-make flash monitor
-```
-
-**Create VGM file**
-
-* [mml2vgm](https://github.com/kuma4649/mml2vgm) by [kumatan](https://github.com/kuma4649) san
-* [mucomMD2vgm](https://github.com/kuma4649/mucomMD2vgm) by [kumatan](https://github.com/kuma4649) san
-
-## Binary release
-
-Extract [release.tar.gz](https://github.com/h1romas4/m5stack-synth-emulation/releases) and Assign the binary to the following address:
-
-|address|module|
-|-|-|
-|`0x1000`|`build/bootloader/bootloader.bin`|
-|`0x8000`|`build/partitions.bin`|
-|`0xe000`|`build/ota_data_initial.bin`|
-|`0x10000`|`build/m5stack-synth-emulation.bin`|
-|`0x211000`|`vgm/ym2612.vgm` or `vgm/sn76489.vgm`|
-
-```
-python ${IDF_PATH}/components/esptool_py/esptool/esptool.py \
-    --chip esp32 \
-    --port <SET IT TO YOUR COM PORT> \
-    --baud 921600 \
-    --before default_reset \
-    --after hard_reset write_flash -z \
-    --flash_mode dio --flash_freq 80m \
-    --flash_size detect \
-    0x1000 ./build/bootloader/bootloader.bin \
-    0x8000 ./build/partitions.bin \
-    0xe000 ./build/ota_data_initial.bin \
-    0x10000 ./build/m5stack-synth-emulation.bin \
-    0x211000 ./vgm/ym2612.vgm
-```
-
-## Dependencies
-
-|name|version|
-|-|-|
-|[esp-idf](https://docs.espressif.com/projects/esp-idf/en/v3.2.3/get-started/index.html)|v3.2.3|
-|[esp32-arduino](https://github.com/espressif/arduino-esp32)|1.0.4|
-|[m5stack](https://github.com/m5stack/M5Stack)|0.2.9|
-
-## License
-
-[GNU General Public License v2.0](https://github.com/h1romas4/m5stack-synth-emulation/blob/master/LICENSE.txt)
-
-## Thanks!
-
-* [sn76489.c](https://github.com/vgmrips/vgmplay/blob/master/VGMPlay/chips/sn76489.c)
-* [ym2612.cpp](https://github.com/lutris/gens/blob/master/src/gens/gens_core/sound/ym2612.cpp)
+M5Stackでポケットカメラの信号を受信する箇所、およびビットマップに変換する箇所は、[Dhole氏の解析結果](https://dhole.github.io/post/gameboy_serial_2/)を利用しています。
